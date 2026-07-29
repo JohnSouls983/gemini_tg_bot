@@ -32,7 +32,7 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 chat_histories: dict[int, list[dict]] = {}
 
 # Пробуем модели по очереди: если основная перегружена (503) или квота (429), едем на следующую
-MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+MODELS = ["gemini-flash-latest", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
 
 # Здесь описываешь персонажа: кто он, как разговаривает, какой у него характер.
 # Чем конкретнее — тем лучше держит роль.
