@@ -31,7 +31,8 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 # Простая память по чатам: chat_id -> список сообщений (история диалога)
 chat_histories: dict[int, list[dict]] = {}
 
-MODEL = "gemini-flash-latest"
+# Пробуем модели по очереди: если основная перегружена (503), едем на следующую
+MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]
 
 # Здесь описываешь персонажа: кто он, как разговаривает, какой у него характер.
 # Чем конкретнее — тем лучше держит роль.
@@ -83,16 +84,29 @@ async def handle_message(message: Message):
 
     await bot.send_chat_action(chat_id, "typing")
 
-    try:
-        response = gemini_client.models.generate_content(
-            model=MODEL,
-            contents=history,
-            config={"system_instruction": SYSTEM_PROMPT},
-        )
-        answer = response.text
-    except Exception as e:
-        logging.exception("Gemini API error")
-        answer = f"Ошибка при обращении к Gemini: {e}"
+    answer = None
+    last_error = None
+
+    for model in MODELS:
+        for attempt in range(2):  # 2 попытки на каждую модель
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model,
+                    contents=history,
+                    config={"system_instruction": SYSTEM_PROMPT},
+                )
+                answer = response.text
+                break
+            except Exception as e:
+                last_error = e
+                logging.warning(f"Model {model} attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(2)
+        if answer:
+            break
+
+    if answer is None:
+        logging.exception("Все модели недоступны")
+        answer = f"Ошибка при обращении к Gemini: {last_error}"
 
     history.append({"role": "model", "parts": [{"text": answer}]})
 
