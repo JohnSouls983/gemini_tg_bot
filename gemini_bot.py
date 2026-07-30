@@ -320,30 +320,6 @@ def build_system_prompt(chat_id: int) -> str:
     return SYSTEM_PROMPT + state_block
 
 
-def get_response_delay_seconds() -> float:
-    """Реальная пауза перед ответом — зависит от времени суток, плюс рандомный
-    шанс на более долгую задержку ("отвлеклась", "уснула на полуслове")."""
-    hour = datetime.now(KYIV_TZ).hour
-
-    if 0 <= hour < 7:
-        base_range = (15, 60)       # ночь — может не сразу увидеть сообщение
-        long_delay_chance = 0.35
-    elif 7 <= hour < 11:
-        base_range = (5, 25)        # утро — только включается
-        long_delay_chance = 0.15
-    elif 11 <= hour < 18:
-        base_range = (2, 12)        # день — обычно относительно быстро
-        long_delay_chance = 0.1
-    else:
-        base_range = (3, 20)        # вечер
-        long_delay_chance = 0.15
-
-    delay = random.uniform(*base_range)
-    if random.random() < long_delay_chance:
-        delay += random.uniform(30, 180)  # "отвлеклась на что-то"
-    return delay
-
-
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     chat_histories[message.chat.id] = []
@@ -415,16 +391,6 @@ async def handle_message(message: Message):
 
     chat_ignore_streak[chat_id] = 0
     history.append({"role": "model", "parts": [{"text": answer}]})
-
-    # Реальная человеческая пауза перед ответом (не мгновенная выдача текста).
-    # "typing" в телеграме держится ~5 сек, поэтому обновляем его по ходу паузы.
-    delay = get_response_delay_seconds()
-    elapsed = 0.0
-    while elapsed < delay:
-        await bot.send_chat_action(chat_id, "typing")
-        step = min(4.0, delay - elapsed)
-        await asyncio.sleep(step)
-        elapsed += step
 
     await message.answer(answer)
 
