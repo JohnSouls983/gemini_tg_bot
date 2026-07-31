@@ -168,6 +168,21 @@ OPINION_TAG_INSTRUCTION = """
 ␟OPINION:topic=кратко тема;stance=твоя позиция в двух словах␟
 Если мнения в этом ответе не было — не добавляй этот тег вообще."""
 
+# Инициатива: когда она пишет сама, без входящего сообщения от собеседника.
+# chat_id -> datetime последнего сообщения (в любую сторону) и последней
+# инициативы конкретно от неё — нужно и то, и другое для условий ниже.
+chat_last_activity: dict[int, datetime] = {}
+chat_last_initiated: dict[int, datetime] = {}
+
+PROACTIVE_NUDGE = """
+
+Собеседник тебе сейчас не писал — ты сама, без повода, решила написать первой.
+Это может быть мысль, которая пришла в голову, что-то из того, что у тебя
+сегодня происходило, или просто "как ты там" — что угодно в твоём характере.
+Пиши коротко, как реальный человек, который сам захотел написать, а не
+отвечает на вопрос. Не упоминай, что "решила написать, потому что давно не
+было сообщений" — просто пиши так, будто это естественный порыв."""
+
 
 def decay_emotional_state(chat_id: int) -> dict:
     """Эмоция угасает на фиксированный шаг с каждым новым сообщением."""
@@ -320,6 +335,45 @@ def build_system_prompt(chat_id: int) -> str:
     return SYSTEM_PROMPT + state_block
 
 
+async def generate_reply(chat_id: int, contents: list, extra_system_note: str = "") -> str | None:
+    """Общая функция вызова Gemini с перебором моделей при 503/429.
+    Используется и для обычных ответов, и для инициативных сообщений."""
+    dynamic_prompt = build_system_prompt(chat_id)
+    if extra_system_note:
+        dynamic_prompt += "\n\n" + extra_system_note
+
+    for model in MODELS:
+        for attempt in range(2):  # 2 попытки на каждую модель
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config={
+                        "system_instruction": dynamic_prompt,
+                        "thinking_config": {"thinking_level": "medium"},
+                    },
+                )
+                return response.text
+            except Exception as e:
+                logging.warning(f"Model {model} attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(2)
+    return None
+
+
+def process_response_tags(chat_id: int, raw_text: str) -> tuple[str, bool, float]:
+    """Парсит и вырезает теги BOUND/STATE/OPINION из сырого ответа модели,
+    обновляет всю память состояния. Возвращает (чистый_текст, violation, severity)."""
+    boundary_match = BOUNDARY_TAG_RE.search(raw_text)
+    violation = bool(boundary_match and boundary_match.group(1) == "1")
+    severity = float(boundary_match.group(2)) if boundary_match else 0.0
+    text = BOUNDARY_TAG_RE.sub("", raw_text).strip()
+
+    update_boundary_state(chat_id, violation, severity)
+    text = update_emotional_state(chat_id, text)
+    text = update_opinions(chat_id, text)
+    return text, violation, severity
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     chat_histories[message.chat.id] = []
@@ -330,6 +384,7 @@ async def cmd_start(message: Message):
 async def handle_message(message: Message):
     chat_id = message.chat.id
     history = chat_histories.setdefault(chat_id, [])
+    chat_last_activity[chat_id] = datetime.now(KYIV_TZ)
 
     # Если предыдущий ход тоже был от пользователя (например, она только что
     # промолчала на прошлое сообщение) — приклеиваем новое сообщение к тому же
@@ -341,46 +396,13 @@ async def handle_message(message: Message):
 
     await bot.send_chat_action(chat_id, "typing")
 
-    dynamic_prompt = build_system_prompt(chat_id)
+    raw_answer = await generate_reply(chat_id, history)
 
-    answer = None
-    last_error = None
-
-    for model in MODELS:
-        for attempt in range(2):  # 2 попытки на каждую модель
-            try:
-                response = gemini_client.models.generate_content(
-                    model=model,
-                    contents=history,
-                    config={
-                        "system_instruction": dynamic_prompt,
-                        "thinking_config": {"thinking_level": "medium"},
-                    },
-                )
-                answer = response.text
-                break
-            except Exception as e:
-                last_error = e
-                logging.warning(f"Model {model} attempt {attempt + 1} failed: {e}")
-                await asyncio.sleep(2)
-        if answer:
-            break
-
-    if answer is None:
-        logging.exception("Все модели недоступны")
-        answer = f"Ошибка при обращении к Gemini: {last_error}"
-        await message.answer(answer)
+    if raw_answer is None:
+        await message.answer("Ошибка при обращении к Gemini: все модели недоступны, попробуй чуть позже.")
         return
 
-    # Парсим границы ДО того, как чистим текст от эмоционального тега
-    boundary_match = BOUNDARY_TAG_RE.search(answer)
-    violation = bool(boundary_match and boundary_match.group(1) == "1")
-    severity = float(boundary_match.group(2)) if boundary_match else 0.0
-    answer = BOUNDARY_TAG_RE.sub("", answer).strip()
-
-    update_boundary_state(chat_id, violation, severity)
-    answer = update_emotional_state(chat_id, answer)
-    answer = update_opinions(chat_id, answer)
+    answer, violation, severity = process_response_tags(chat_id, raw_answer)
 
     if should_ignore_message(chat_id, violation, severity):
         chat_ignore_streak[chat_id] = chat_ignore_streak.get(chat_id, 0) + 1
@@ -391,11 +413,73 @@ async def handle_message(message: Message):
 
     chat_ignore_streak[chat_id] = 0
     history.append({"role": "model", "parts": [{"text": answer}]})
+    chat_last_activity[chat_id] = datetime.now(KYIV_TZ)
 
     await message.answer(answer)
 
 
+async def send_proactive_message(chat_id: int):
+    """Она сама пишет первой — без входящего сообщения от собеседника."""
+    history = chat_histories.setdefault(chat_id, [])
+
+    # Временная копия истории только для этого вызова: добавляем нейтральную
+    # "затравку", чтобы Gemini API получил валидный user-ход перед генерацией
+    # (сам текст-инструкция живёт в system prompt, а не тут).
+    temp_contents = history + [
+        {"role": "user", "parts": [{"text": "(нет нового сообщения — руководствуйся системной пометкой об инициативе)"}]}
+    ]
+
+    raw_answer = await generate_reply(chat_id, temp_contents, extra_system_note=PROACTIVE_NUDGE)
+    if raw_answer is None:
+        logging.warning(f"Chat {chat_id}: не удалось сгенерировать инициативное сообщение")
+        return
+
+    answer, _, _ = process_response_tags(chat_id, raw_answer)
+
+    history.append({"role": "model", "parts": [{"text": answer}]})
+    now = datetime.now(KYIV_TZ)
+    chat_last_activity[chat_id] = now
+    chat_last_initiated[chat_id] = now
+
+    await bot.send_message(chat_id, answer)
+    logging.info(f"Chat {chat_id}: отправлено инициативное сообщение")
+
+
+async def proactive_loop():
+    """Фоновая проверка раз в 15 минут: не пора ли ей написать первой."""
+    while True:
+        await asyncio.sleep(15 * 60)
+        now = datetime.now(KYIV_TZ)
+
+        for chat_id, history in list(chat_histories.items()):
+            if not history:
+                continue  # ещё не было /start с реальным диалогом
+
+            last_activity = chat_last_activity.get(chat_id)
+            if last_activity is None:
+                continue
+
+            hours_since_activity = (now - last_activity).total_seconds() / 3600
+            if hours_since_activity < 3:
+                continue  # переписывались совсем недавно, рано
+
+            last_initiated = chat_last_initiated.get(chat_id)
+            if last_initiated:
+                hours_since_initiated = (now - last_initiated).total_seconds() / 3600
+                if hours_since_initiated < 5:
+                    continue  # не чаще раза в 5+ часов сама не пишет
+
+            hour = now.hour
+            if hour < 8 or hour >= 24:
+                continue  # ночью первой не пишет
+
+            base_chance = 0.12  # шанс на каждую проверку (раз в 15 мин)
+            if random.random() < base_chance:
+                await send_proactive_message(chat_id)
+
+
 async def main():
+    asyncio.create_task(proactive_loop())
     await dp.start_polling(bot)
 
 
