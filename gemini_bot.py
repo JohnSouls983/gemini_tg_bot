@@ -18,7 +18,7 @@ import re
 from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 from google import genai
 
@@ -378,6 +378,18 @@ def process_response_tags(chat_id: int, raw_text: str) -> tuple[str, bool, float
 async def cmd_start(message: Message):
     chat_histories[message.chat.id] = []
     await message.answer("Привет! Я тестовый бот на Gemini. Пиши что угодно.")
+
+
+@dp.message(Command("poke"))
+async def cmd_poke(message: Message):
+    """Тестовая команда: сразу генерирует инициативное сообщение, без ожидания
+    15 минут и без проверки вероятностей/условий по времени."""
+    chat_id = message.chat.id
+    if chat_id not in chat_histories:
+        await message.answer("Сначала напиши /start, чтобы был диалог.")
+        return
+    await message.answer("(тест: форсирую инициативное сообщение...)")
+    await send_proactive_message(chat_id)
 
 
 @dp.message()
