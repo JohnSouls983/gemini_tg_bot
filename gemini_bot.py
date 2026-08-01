@@ -18,7 +18,7 @@ import random
 import re
 from datetime import datetime, timezone, timedelta
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 from google import genai
@@ -434,6 +434,64 @@ async def cmd_remember(message: Message):
     chat_backstory[chat_id] = combined
     save_state()
     await message.answer(f"Загрузила ({len(pasted)} симв.). Теперь это часть её фонового контекста.")
+
+
+@dp.message(F.document)
+async def handle_exported_chat_file(message: Message):
+    """Принимает result.json из Telegram Desktop (Export chat history) и
+    парсит его целиком в фоновый контекст — без ограничения в 100 сообщений,
+    которое есть при ручном копировании через выделение."""
+    caption = (message.caption or "").strip().lower()
+    if not caption.startswith("/remember_file"):
+        await message.answer(
+            "Чтобы загрузить экспорт чата — пришли файл result.json с подписью "
+            "/remember_file (Telegram Desktop → меню чата → Export chat history → формат JSON)."
+        )
+        return
+
+    chat_id = message.chat.id
+    await message.answer("Разбираю файл...")
+
+    try:
+        file = await bot.get_file(message.document.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        data = json.loads(file_bytes.read())
+    except Exception as e:
+        await message.answer(f"Не смогла прочитать/распарсить файл: {e}")
+        return
+
+    raw_messages = data.get("messages", [])
+    lines = []
+    for m in raw_messages:
+        if m.get("type") != "message":
+            continue
+        text = m.get("text", "")
+        if isinstance(text, list):
+            # В экспорте текст с форматированием (ссылки, жирный и т.п.)
+            # приходит массивом частей — склеиваем в обычную строку.
+            text = "".join(part if isinstance(part, str) else part.get("text", "") for part in text)
+        text = text.strip()
+        if not text:
+            continue
+        sender = m.get("from", "?")
+        lines.append(f"{sender}: {text}")
+
+    if not lines:
+        await message.answer("В файле не нашла текстовых сообщений.")
+        return
+
+    full_text = "\n".join(lines)
+    MAX_BACKSTORY_CHARS = 8000
+    total_found = len(lines)
+    if len(full_text) > MAX_BACKSTORY_CHARS:
+        full_text = full_text[-MAX_BACKSTORY_CHARS:]  # оставляем более свежую часть
+
+    chat_backstory[chat_id] = full_text
+    save_state()
+    await message.answer(
+        f"Загрузила {total_found} сообщений из файла "
+        f"(в контексте держится последние ~{MAX_BACKSTORY_CHARS} симв.)."
+    )
 
 
 @dp.message()
