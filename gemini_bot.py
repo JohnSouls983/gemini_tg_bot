@@ -180,6 +180,31 @@ chat_last_initiated: dict[int, datetime] = {}
 # /remember — она будет постоянным фоновым контекстом в system prompt.
 chat_backstory: dict[int, str] = {}
 
+# Прогрессия близости: копится ВСЁ время знакомства (не сбрасывается сессией,
+# в отличие от настроения/эмоций) — по мере роста она естественно открытее.
+chat_message_count: dict[int, int] = {}
+
+# Скука: она сама оценивает, не забуксовал ли разговор — копится streak,
+# при накоплении явно подталкиваем её самой сменить тему.
+chat_boredom_streak: dict[int, int] = {}
+
+BORED_TAG_RE = re.compile(r"␟BORED:level=([0-9.]+)␟")
+
+BOREDOM_TAG_INSTRUCTION = """
+
+Оцени (в размышлении, перед ответом): не крутится ли разговор последние
+несколько сообщений вокруг одного и того же без развития — повторяющиеся
+вопросы, зависшая тема, собеседник отвечает односложно и не двигает беседу.
+Если да — не обязана покорно продолжать ту же тему просто из вежливости:
+можешь сама естественно перевести разговор на другое (спросить что-то новое,
+поделиться своей мыслью, подколоть, что зашли в тупик) — как реальный человек,
+которому наскучило.
+
+Необязательный тег в конце (после остальных, тоже скрыт от пользователя),
+добавляй только если реально оценивала скуку в этом ответе:
+␟BORED:level=Y␟
+Y от 0 (беседа живая, интересно) до 1 (совсем зависли на месте)."""
+
 PROACTIVE_NUDGE = """
 
 Собеседник тебе сейчас не писал — ты сама, без повода, решила написать первой.
@@ -253,6 +278,40 @@ def opinions_description(chat_id: int) -> str:
         return "пока не успела высказать устойчивых позиций в этом разговоре"
     lines = [f'- по теме "{topic}": {stance}' for topic, stance in list(opinions.items())[-12:]]
     return "ранее ты уже говорила (держись этого, не разворачивайся без причины):\n" + "\n".join(lines)
+
+
+def closeness_description(chat_id: int) -> str:
+    """Близость растёт от общего числа реальных сообщений за всё время
+    знакомства — не сбрасывается сессией/настроением, копится постоянно."""
+    count = chat_message_count.get(chat_id, 0)
+    if count < 10:
+        return "вы только начали общаться — держишься чуть аккуратнее, не спешишь делиться личным"
+    if count < 40:
+        return "уже освоилась в общении — свободнее шутишь, но глубоко личное пока не каждый раз"
+    if count < 100:
+        return "довольно близкое общение — открыта, делишься подробностями из жизни без больших фильтров"
+    return "как с близким человеком — минимум формальностей, тепло и открытость по умолчанию"
+
+
+def update_boredom(chat_id: int, raw_text: str) -> str:
+    """Парсит необязательный тег скуки, копит streak, возвращает текст без тега."""
+    match = BORED_TAG_RE.search(raw_text)
+    if match:
+        level = float(match.group(1))
+        if level >= 0.5:
+            chat_boredom_streak[chat_id] = chat_boredom_streak.get(chat_id, 0) + 1
+        else:
+            chat_boredom_streak[chat_id] = 0
+    return BORED_TAG_RE.sub("", raw_text).strip()
+
+
+def boredom_description(chat_id: int) -> str:
+    streak = chat_boredom_streak.get(chat_id, 0)
+    if streak == 0:
+        return "разговор ощущается живым"
+    if streak < 2:
+        return "последнее сообщение показалось чуть скучноватым/зависшим"
+    return f"уже {streak} раз подряд разговор казался застрявшим — в этот раз реально смени тему сама, не жди"
 
 
 def grudge_description(chat_id: int) -> str:
@@ -342,11 +401,14 @@ def build_system_prompt(chat_id: int) -> str:
 - Эмоциональный остаток от разговора: {emotional_state_description(chat_id)}
 - Накопленное напряжение в общении: {grudge_description(chat_id)}
 - Твои личные мнения/позиции: {opinions_description(chat_id)}
+- Близость знакомства: {closeness_description(chat_id)}
+- Ощущение от разговора: {boredom_description(chat_id)}
 - Что происходило сегодня (можешь упомянуть, если к слову придётся, не
   обязательно): {get_daily_topic()}
 {EMOTION_TAG_INSTRUCTION}
 {BOUNDARY_TAG_INSTRUCTION}
 {OPINION_TAG_INSTRUCTION}
+{BOREDOM_TAG_INSTRUCTION}
 """
     return SYSTEM_PROMPT + backstory_block + state_block
 
@@ -387,6 +449,7 @@ def process_response_tags(chat_id: int, raw_text: str) -> tuple[str, bool, float
     update_boundary_state(chat_id, violation, severity)
     text = update_emotional_state(chat_id, text)
     text = update_opinions(chat_id, text)
+    text = update_boredom(chat_id, text)
     return text, violation, severity
 
 
@@ -533,6 +596,7 @@ async def handle_message(message: Message):
         return
 
     chat_ignore_streak[chat_id] = 0
+    chat_message_count[chat_id] = chat_message_count.get(chat_id, 0) + 1
     history.append({"role": "model", "parts": [{"text": answer}]})
     chat_last_activity[chat_id] = datetime.now(KYIV_TZ)
     save_state()
@@ -626,6 +690,8 @@ def save_state():
             "chat_ignore_streak": chat_ignore_streak,
             "chat_opinions": chat_opinions,
             "chat_backstory": chat_backstory,
+            "chat_message_count": chat_message_count,
+            "chat_boredom_streak": chat_boredom_streak,
             "chat_last_activity": {k: v.isoformat() for k, v in chat_last_activity.items()},
             "chat_last_initiated": {k: v.isoformat() for k, v in chat_last_initiated.items()},
         }
@@ -650,6 +716,8 @@ def load_state():
         chat_ignore_streak.update({int(k): v for k, v in data.get("chat_ignore_streak", {}).items()})
         chat_opinions.update({int(k): v for k, v in data.get("chat_opinions", {}).items()})
         chat_backstory.update({int(k): v for k, v in data.get("chat_backstory", {}).items()})
+        chat_message_count.update({int(k): v for k, v in data.get("chat_message_count", {}).items()})
+        chat_boredom_streak.update({int(k): v for k, v in data.get("chat_boredom_streak", {}).items()})
         chat_last_activity.update({int(k): datetime.fromisoformat(v) for k, v in data.get("chat_last_activity", {}).items()})
         chat_last_initiated.update({int(k): datetime.fromisoformat(v) for k, v in data.get("chat_last_initiated", {}).items()})
 
