@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -398,13 +399,19 @@ async def handle_message(message: Message):
     history = chat_histories.setdefault(chat_id, [])
     chat_last_activity[chat_id] = datetime.now(KYIV_TZ)
 
+    user_text = message.text
+    if user_text is None and message.sticker:
+        user_text = f"[отправил стикер {message.sticker.emoji or '🙂'}]"
+    elif user_text is None:
+        user_text = "[не-текстовое сообщение]"
+
     # Если предыдущий ход тоже был от пользователя (например, она только что
     # промолчала на прошлое сообщение) — приклеиваем новое сообщение к тому же
     # ходу, а не создаём новый: Gemini API требует чередования ролей.
     if history and history[-1]["role"] == "user":
-        history[-1]["parts"].append({"text": message.text})
+        history[-1]["parts"].append({"text": user_text})
     else:
-        history.append({"role": "user", "parts": [{"text": message.text}]})
+        history.append({"role": "user", "parts": [{"text": user_text}]})
 
     await bot.send_chat_action(chat_id, "typing")
 
@@ -419,6 +426,7 @@ async def handle_message(message: Message):
     if should_ignore_message(chat_id, violation, severity):
         chat_ignore_streak[chat_id] = chat_ignore_streak.get(chat_id, 0) + 1
         logging.info(f"Chat {chat_id}: игнорирую сообщение (grudge={chat_grudge.get(chat_id, 0):.2f})")
+        save_state()
         # Ответ не отправляется и не сохраняется в историю — она "промолчала".
         # Следующее сообщение пользователя допишется к этому же user-ходу.
         return
@@ -426,6 +434,7 @@ async def handle_message(message: Message):
     chat_ignore_streak[chat_id] = 0
     history.append({"role": "model", "parts": [{"text": answer}]})
     chat_last_activity[chat_id] = datetime.now(KYIV_TZ)
+    save_state()
 
     await message.answer(answer)
 
@@ -452,6 +461,7 @@ async def send_proactive_message(chat_id: int):
     now = datetime.now(KYIV_TZ)
     chat_last_activity[chat_id] = now
     chat_last_initiated[chat_id] = now
+    save_state()
 
     await bot.send_message(chat_id, answer)
     logging.info(f"Chat {chat_id}: отправлено инициативное сообщение")
@@ -495,5 +505,56 @@ async def main():
     await dp.start_polling(bot)
 
 
+# --- Персистентная память между перезапусками/передеплоями ---
+# ВАЖНО: файловая система Railway по умолчанию эфемерна — при передеплое
+# всё содержимое диска стирается. Чтобы этот файл реально сохранялся между
+# деплоями, в проекте Railway нужно подключить Volume (Settings → Volumes,
+# указать mount path — например /data) и поменять STATE_FILE ниже на
+# "/data/bot_state.json". Без Volume файл всё равно будет обнуляться, просто
+# уже не при каждой правке кода, а честно — при любом рестарте контейнера.
+STATE_FILE = "/data/bot_state.json"
+
+
+def save_state():
+    try:
+        data = {
+            "chat_histories": chat_histories,
+            "chat_moods": chat_moods,
+            "chat_emotional_state": chat_emotional_state,
+            "chat_grudge": chat_grudge,
+            "chat_ignore_streak": chat_ignore_streak,
+            "chat_opinions": chat_opinions,
+            "chat_last_activity": {k: v.isoformat() for k, v in chat_last_activity.items()},
+            "chat_last_initiated": {k: v.isoformat() for k, v in chat_last_initiated.items()},
+        }
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logging.warning(f"Не удалось сохранить состояние: {e}")
+
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # JSON превращает int-ключи chat_id в строки — конвертируем обратно
+        chat_histories.update({int(k): v for k, v in data.get("chat_histories", {}).items()})
+        chat_moods.update({int(k): v for k, v in data.get("chat_moods", {}).items()})
+        chat_emotional_state.update({int(k): v for k, v in data.get("chat_emotional_state", {}).items()})
+        chat_grudge.update({int(k): v for k, v in data.get("chat_grudge", {}).items()})
+        chat_ignore_streak.update({int(k): v for k, v in data.get("chat_ignore_streak", {}).items()})
+        chat_opinions.update({int(k): v for k, v in data.get("chat_opinions", {}).items()})
+        chat_last_activity.update({int(k): datetime.fromisoformat(v) for k, v in data.get("chat_last_activity", {}).items()})
+        chat_last_initiated.update({int(k): datetime.fromisoformat(v) for k, v in data.get("chat_last_initiated", {}).items()})
+
+        logging.info(f"Состояние загружено: {len(chat_histories)} чат(ов)")
+    except Exception as e:
+        logging.warning(f"Не удалось загрузить состояние: {e}")
+
+
 if __name__ == "__main__":
+    load_state()
     asyncio.run(main())
