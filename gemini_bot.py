@@ -175,6 +175,11 @@ OPINION_TAG_INSTRUCTION = """
 chat_last_activity: dict[int, datetime] = {}
 chat_last_initiated: dict[int, datetime] = {}
 
+# Ручная "загрузка памяти": если история потерялась (например, ты сделал
+# /start и стёр её), можно вручную вставить старую переписку командой
+# /remember — она будет постоянным фоновым контекстом в system prompt.
+chat_backstory: dict[int, str] = {}
+
 PROACTIVE_NUDGE = """
 
 Собеседник тебе сейчас не писал — ты сама, без повода, решила написать первой.
@@ -317,6 +322,16 @@ def get_daily_topic() -> str:
 def build_system_prompt(chat_id: int) -> str:
     """Собирает финальный system prompt: базовый лор + текущее состояние."""
     mood = get_mood(chat_id)
+    backstory = chat_backstory.get(chat_id, "")
+    backstory_block = ""
+    if backstory:
+        backstory_block = f"""
+
+Контекст из более раннего периода общения с этим человеком (это реально
+было, ты это помнишь — веди себя так, будто знаешь эту историю, не делай вид,
+что видишь его впервые):
+{backstory}
+"""
     state_block = f"""
 
 Твоё текущее состояние (учитывай в тоне и длине ответов, но не объявляй это
@@ -333,7 +348,7 @@ def build_system_prompt(chat_id: int) -> str:
 {BOUNDARY_TAG_INSTRUCTION}
 {OPINION_TAG_INSTRUCTION}
 """
-    return SYSTEM_PROMPT + state_block
+    return SYSTEM_PROMPT + backstory_block + state_block
 
 
 async def generate_reply(chat_id: int, contents: list, extra_system_note: str = "") -> str | None:
@@ -391,6 +406,34 @@ async def cmd_poke(message: Message):
         return
     await message.answer("(тест: форсирую инициативное сообщение...)")
     await send_proactive_message(chat_id)
+
+
+@dp.message(Command("remember"))
+async def cmd_remember(message: Message):
+    """Ручная загрузка старой переписки в память. Использование:
+    /remember <вставленный текст переписки>
+    Текст добавляется (не заменяет) в постоянный фоновый контекст."""
+    chat_id = message.chat.id
+    text = message.text or ""
+    pasted = text[len("/remember"):].strip()
+
+    if not pasted:
+        await message.answer(
+            "Использование: /remember и после пробела вставь скопированный текст "
+            "переписки (выдели сообщения в Telegram → Copy, затем вставь сюда)."
+        )
+        return
+
+    existing = chat_backstory.get(chat_id, "")
+    combined = (existing + "\n\n" + pasted).strip() if existing else pasted
+    # Ограничиваем размер, чтобы не раздувать каждый запрос до неба
+    MAX_BACKSTORY_CHARS = 8000
+    if len(combined) > MAX_BACKSTORY_CHARS:
+        combined = combined[-MAX_BACKSTORY_CHARS:]
+
+    chat_backstory[chat_id] = combined
+    save_state()
+    await message.answer(f"Загрузила ({len(pasted)} симв.). Теперь это часть её фонового контекста.")
 
 
 @dp.message()
@@ -524,6 +567,7 @@ def save_state():
             "chat_grudge": chat_grudge,
             "chat_ignore_streak": chat_ignore_streak,
             "chat_opinions": chat_opinions,
+            "chat_backstory": chat_backstory,
             "chat_last_activity": {k: v.isoformat() for k, v in chat_last_activity.items()},
             "chat_last_initiated": {k: v.isoformat() for k, v in chat_last_initiated.items()},
         }
@@ -547,6 +591,7 @@ def load_state():
         chat_grudge.update({int(k): v for k, v in data.get("chat_grudge", {}).items()})
         chat_ignore_streak.update({int(k): v for k, v in data.get("chat_ignore_streak", {}).items()})
         chat_opinions.update({int(k): v for k, v in data.get("chat_opinions", {}).items()})
+        chat_backstory.update({int(k): v for k, v in data.get("chat_backstory", {}).items()})
         chat_last_activity.update({int(k): datetime.fromisoformat(v) for k, v in data.get("chat_last_activity", {}).items()})
         chat_last_initiated.update({int(k): datetime.fromisoformat(v) for k, v in data.get("chat_last_initiated", {}).items()})
 
